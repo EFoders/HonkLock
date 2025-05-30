@@ -82,12 +82,12 @@ func ensureVaultsDir() error {
 
 func printHelp() {
 	fmt.Println("Available commands:")
-	fmt.Println("  list               - List all vaults (if no vault selected) or entries in current vault")
+	fmt.Println("  list, ls           - List all vaults (if no vault selected) or entries in current vault")
 	fmt.Println("  use <vaultfile>    - Select a vault to use")
 	fmt.Println("  init <vaultfile>   - Initialize a new vault")
 	fmt.Println("  add                - Add a new password entry to current vault")
 	fmt.Println("  get                - Get password from current vault")
-	fmt.Println("  rm                 - Remove an entry from current vault")
+	fmt.Println("  rm                 - Remove a vault or an entry from current vault")
 	fmt.Println("  update             - Update an entry in current vault")
 	fmt.Println("  help               - Show this help message")
 	fmt.Println("  back               - Deselect the current vault")
@@ -106,9 +106,6 @@ func handleCommand(command string, vaultFile string, args []string) {
 			fmt.Println("Failed to load vault:", err)
 			return
 		}
-		password := promptPassword("Enter vault password (will be hidden): ")
-		salt, _ := cryptotools.Base64Decode(vault.Salt)
-		vaultKey := cryptotools.DeriveVaultKey([]byte(password), salt)
 
 		var id string
 		if len(args) >= 1 {
@@ -116,6 +113,31 @@ func handleCommand(command string, vaultFile string, args []string) {
 		} else {
 			id = promptInput("Entry ID: ")
 		}
+
+		// Check if entry ID already exists
+		for _, entry := range vault.Entries {
+			if entry.ID == id {
+				fmt.Println("Error: An entry with ID", id, "already exists.")
+				return
+			}
+		}
+
+		password := promptPassword("Enter vault password (will be hidden): ")
+		salt, _ := cryptotools.Base64Decode(vault.Salt)
+		vaultKey := cryptotools.DeriveVaultKey([]byte(password), salt)
+
+		// Verify password by attempting to decrypt an entry
+		if len(vault.Entries) > 0 {
+			entry := vault.Entries[0]
+			nonce, _ := cryptotools.Base64Decode(entry.Nonce)
+			cipher, _ := cryptotools.Base64Decode(entry.Cipher)
+			_, err := cryptotools.DecryptEntry(cipher, nonce, vaultKey)
+			if err != nil {
+				fmt.Println("Incorrect password.")
+				return
+			}
+		}
+
 		secret := promptPassword("Enter password for the entry (will be hidden): ")
 
 		nonce, cipher, err := cryptotools.EncryptEntry([]byte(secret), vaultKey)
@@ -152,6 +174,20 @@ func handleCommand(command string, vaultFile string, args []string) {
 			fmt.Println("Failed to load vault:", err)
 			return
 		}
+
+		// Check if entry exists before asking for password
+		var entryExists bool
+		for _, entry := range vault.Entries {
+			if entry.ID == entryID {
+				entryExists = true
+				break
+			}
+		}
+		if !entryExists {
+			fmt.Println("Entry not found:", entryID)
+			return
+		}
+
 		password := promptPassword("Enter vault password (will be hidden): ")
 		salt, _ := cryptotools.Base64Decode(vault.Salt)
 		vaultKey := cryptotools.DeriveVaultKey([]byte(password), salt)
@@ -182,20 +218,79 @@ func handleCommand(command string, vaultFile string, args []string) {
 		fmt.Println("Entry not found.")
 
 	case "rm":
+		if len(args) < 1 {
+			fmt.Println("Usage: rm <entry_id> or rm <vaultfile>")
+			return
+		}
+		target := args[0]
 
 		if vaultFile == "" {
-			fmt.Println("No vault selected.")
-			return
-		}
-		if len(args) < 1 {
-			fmt.Println("Usage: rm <entry_id>")
-			return
-		}
-		entryID := args[0]
+			// Remove entire vault
+			vp := vaultPath(target)
+			if _, err := os.Stat(vp); os.IsNotExist(err) {
+				fmt.Println("Vault does not exist:", target)
+				return
+			}
 
+			// Load vault to verify password
+			vault, err := loadVault(target)
+			if err != nil {
+				fmt.Println("Failed to load vault:", err)
+				return
+			}
+
+			password := promptPassword("Enter vault password to confirm deletion (will be hidden): ")
+			salt, _ := cryptotools.Base64Decode(vault.Salt)
+			vaultKey := cryptotools.DeriveVaultKey([]byte(password), salt)
+
+			// Verify password by attempting to decrypt an entry
+			var passwordCorrect bool
+			if len(vault.Entries) > 0 {
+				entry := vault.Entries[0]
+				nonce, _ := cryptotools.Base64Decode(entry.Nonce)
+				cipher, _ := cryptotools.Base64Decode(entry.Cipher)
+				_, err := cryptotools.DecryptEntry(cipher, nonce, vaultKey)
+				if err != nil {
+					fmt.Println("Incorrect password.")
+					return
+				}
+				passwordCorrect = true
+			} else {
+				passwordCorrect = true
+				fmt.Println("No entries in vault, proceeding with deletion.")
+			}
+
+			if !passwordCorrect {
+				fmt.Println("Incorrect password.")
+				return
+			}
+
+			err = os.Remove(vp)
+			if err != nil {
+				fmt.Println("Failed to remove vault:", err)
+				return
+			}
+			fmt.Println("Vault removed:", target)
+			return
+		}
+
+		// Remove entry from vault
 		vault, err := loadVault(vaultFile)
 		if err != nil {
 			fmt.Println("Failed to load vault:", err)
+			return
+		}
+
+		// Check if entry exists before asking for password
+		var entryExists bool
+		for _, entry := range vault.Entries {
+			if entry.ID == target {
+				entryExists = true
+				break
+			}
+		}
+		if !entryExists {
+			fmt.Println("Entry not found:", target)
 			return
 		}
 
@@ -205,8 +300,9 @@ func handleCommand(command string, vaultFile string, args []string) {
 
 		// Verify password by attempting to decrypt an entry
 		var found bool
+		var passwordCorrect bool
 		for _, entry := range vault.Entries {
-			if entry.ID == entryID {
+			if entry.ID == target {
 				nonce, _ := cryptotools.Base64Decode(entry.Nonce)
 				cipher, _ := cryptotools.Base64Decode(entry.Cipher)
 				_, err := cryptotools.DecryptEntry(cipher, nonce, vaultKey)
@@ -214,26 +310,31 @@ func handleCommand(command string, vaultFile string, args []string) {
 					fmt.Println("Incorrect password.")
 					return
 				}
+				passwordCorrect = true
 				found = true
 				break
 			}
 		}
 		if !found {
-			fmt.Println("Entry not found:", entryID)
+			fmt.Println("Entry not found:", target)
+			return
+		}
+		if !passwordCorrect {
+			fmt.Println("Incorrect password.")
 			return
 		}
 
 		newEntries := []VaultEntry{}
 		removed := false
 		for _, entry := range vault.Entries {
-			if entry.ID != entryID {
+			if entry.ID != target {
 				newEntries = append(newEntries, entry)
 			} else {
 				removed = true
 			}
 		}
 		if !removed {
-			fmt.Println("Entry not found:", entryID)
+			fmt.Println("Entry not found:", target)
 			return
 		}
 		vault.Entries = newEntries
@@ -242,7 +343,7 @@ func handleCommand(command string, vaultFile string, args []string) {
 			fmt.Println("Failed to save vault:", err)
 			return
 		}
-		fmt.Println("Entry removed:", entryID)
+		fmt.Println("Entry removed:", target)
 
 	case "update":
 		if vaultFile == "" {
@@ -260,6 +361,20 @@ func handleCommand(command string, vaultFile string, args []string) {
 			fmt.Println("Failed to load vault:", err)
 			return
 		}
+
+		// Check if entry exists before asking for password
+		var entryExists bool
+		for _, entry := range vault.Entries {
+			if entry.ID == entryID {
+				entryExists = true
+				break
+			}
+		}
+		if !entryExists {
+			fmt.Println("Entry not found:", entryID)
+			return
+		}
+
 		password := promptPassword("Enter vault password (will be hidden): ")
 		salt, _ := cryptotools.Base64Decode(vault.Salt)
 		vaultKey := cryptotools.DeriveVaultKey([]byte(password), salt)
@@ -267,8 +382,15 @@ func handleCommand(command string, vaultFile string, args []string) {
 		var found bool
 		for i, entry := range vault.Entries {
 			if entry.ID == entryID {
+				nonce, _ := cryptotools.Base64Decode(entry.Nonce)
+				cipher, _ := cryptotools.Base64Decode(entry.Cipher)
+				_, err := cryptotools.DecryptEntry(cipher, nonce, vaultKey)
+				if err != nil {
+					fmt.Println("Incorrect password.")
+					return
+				}
 				newSecret := promptPassword("Enter new password for the entry (will be hidden): ")
-				nonce, cipher, err := cryptotools.EncryptEntry([]byte(newSecret), vaultKey)
+				nonce, cipher, err = cryptotools.EncryptEntry([]byte(newSecret), vaultKey)
 				if err != nil {
 					fmt.Println("Encryption failed:", err)
 					return
@@ -323,7 +445,7 @@ func main() {
 		cmd := strings.ToLower(args[0])
 
 		switch cmd {
-		case "back":
+		case "back", "..":
 			if currentVault == "" {
 				fmt.Println("No vault is currently selected.")
 			} else {
@@ -335,7 +457,7 @@ func main() {
 		case "exit", "quit":
 			fmt.Println("Exiting honklock.")
 			return
-		case "list":
+		case "list", "ls":
 			if currentVault == "" {
 				files, err := os.ReadDir(vaultsDir)
 				if err != nil {
@@ -403,12 +525,11 @@ func main() {
 			currentVault = vaultPath
 			fmt.Println("Vault created and switched to:", currentVault)
 
-		case "add", "get", "rm", "update":
-			if currentVault == "" {
+		case "add", "get", "update", "rm":
+			if currentVault == "" && cmd != "rm" {
 				fmt.Println("No vault selected. Use 'use <vaultfile>' first.")
 			} else {
 				handleCommand(cmd, currentVault, args[1:])
-
 			}
 		default:
 			fmt.Println("Unknown command. Type 'help' for usage.")
